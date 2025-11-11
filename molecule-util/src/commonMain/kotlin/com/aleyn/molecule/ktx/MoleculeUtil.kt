@@ -1,0 +1,133 @@
+package com.aleyn.molecule.ktx
+
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MonotonicFrameClock
+import androidx.compose.runtime.State
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.viewModelFactory
+import app.cash.molecule.RecompositionMode
+import app.cash.molecule.launchMolecule
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.consumeAsFlow
+import kotlin.coroutines.CoroutineContext
+
+
+/**
+ * @author : Aleyn
+ * @date : 2025/11/11 16:15
+ */
+internal expect fun providePlatformDispatcher(): CoroutineContext
+
+private class PresenterHolder<T>(
+    useImmediateClock: Boolean,
+    body: @Composable () -> T,
+) : ViewModel() {
+    private val dispatcher = providePlatformDispatcher()
+    private val clock = if (useImmediateClock || dispatcher[MonotonicFrameClock] == null) {
+        RecompositionMode.Immediate
+    } else {
+        RecompositionMode.ContextClock
+    }
+    private val scope = CoroutineScope(dispatcher)
+    val state = scope.launchMolecule(mode = clock, body = body)
+
+    override fun onCleared() {
+        scope.cancel()
+    }
+}
+
+private class ActionViewHolder<T> : ViewModel() {
+    val channel = Channel<T>(Channel.UNLIMITED)
+    val pair = channel to channel.consumeAsFlow()
+    override fun onCleared() {
+        channel.close()
+    }
+}
+
+@Composable
+private fun <E> rememberAction(
+    key: String? = null,
+): Pair<Channel<E>, Flow<E>> {
+    return viewModel<ActionViewHolder<E>>(key = key) {
+        ActionViewHolder()
+    }.pair
+}
+
+/**
+ * Return StateFlow, use it in your Compose UI
+ * The molecule scope will be managed by the [ViewModel], so it has the same lifecycle as the [ViewModel]
+ * @param key The key to use to identify the Presenter
+ * @param body The body of the molecule presenter
+ * @return StateFlow
+ */
+@Composable
+private fun <T> rememberPresenterState(
+    key: String? = null,
+    useImmediateClock: Boolean,
+    body: @Composable () -> T,
+): StateFlow<T> {
+    val factory = remember(key) {
+        viewModelFactory {
+            addInitializer(PresenterHolder::class) {
+                PresenterHolder(useImmediateClock, body)
+            }
+        }
+    }
+    return viewModel<PresenterHolder<T>>(key = key, factory = factory).state
+}
+
+@Composable
+fun <T> producePresenter(
+    key: String? = null,
+    useImmediateClock: Boolean = false,
+    body: @Composable () -> T,
+): State<T> {
+    val presenter =
+        rememberPresenterState(key = key, useImmediateClock = useImmediateClock) { body() }
+    return presenter.collectAsState()
+}
+
+
+@Composable
+fun <T, E> rememberPresenter(
+    key: String? = null,
+    useImmediateClock: Boolean = false,
+    body: @Composable (flow: Flow<E>) -> T,
+): Pair<T, Channel<E>> {
+    val (channel, action) = rememberAction<E>(key = key)
+    val presenter =
+        rememberPresenterState(key = key, useImmediateClock = useImmediateClock) { body(action) }
+    val state by presenter.collectAsState()
+    return state to channel
+}
+
+
+@Composable
+fun <T, E> rememberNestedPresenter(
+    body: @Composable (flow: Flow<E>) -> T,
+): Pair<T, Channel<E>> {
+    val channel = remember { Channel<E>(Channel.UNLIMITED) }
+    val flow = remember { channel.consumeAsFlow() }
+    val presenter = body(flow)
+    return presenter to channel
+}
+
+@Composable
+fun <T> Flow<T>.collectAction(
+    body: suspend T.() -> Unit,
+) {
+    LaunchedEffect(Unit) {
+        collect {
+            body(it)
+        }
+    }
+}
